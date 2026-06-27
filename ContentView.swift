@@ -1,9 +1,10 @@
+import Foundation
 import MusicKit
 import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var library: MusicLibraryModel
-    @State private var screenMode: ScreenMode = .library
+    @State private var screenMode: ScreenMode = .nowPlaying
 
     var body: some View {
         GeometryReader { proxy in
@@ -14,6 +15,8 @@ struct ContentView: View {
             )
         }
         .ignoresSafeArea()
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
         .task {
             await library.bootstrap()
         }
@@ -31,23 +34,23 @@ private struct FullScreenPodDevice: View {
     let safeArea: EdgeInsets
 
     private var horizontalPadding: CGFloat {
-        min(max(size.width * 0.045, 16), 24)
+        min(max(size.width * 0.030, 10), 16)
     }
 
     private var topPadding: CGFloat {
-        safeArea.top + min(max(size.height * 0.022, 16), 26)
+        min(max(size.height * 0.018, 12), 20)
     }
 
     private var bottomPadding: CGFloat {
-        safeArea.bottom + min(max(size.height * 0.018, 14), 24)
+        min(max(size.height * 0.012, 8), 16)
     }
 
     private var screenHeight: CGFloat {
-        min(size.height * 0.36, size.width * 0.88)
+        min(size.height * 0.405, size.width * 0.96)
     }
 
     private var wheelDiameter: CGFloat {
-        min(size.width * 0.88, size.height * 0.39)
+        min(size.width * 0.94, size.height * 0.405)
     }
 
     var body: some View {
@@ -67,11 +70,11 @@ private struct FullScreenPodDevice: View {
                     .padding(.horizontal, horizontalPadding)
                     .padding(.top, topPadding)
 
-                Spacer(minLength: 18)
+                Spacer(minLength: 10)
 
                 ClickWheel(screenMode: $screenMode, diameter: wheelDiameter)
 
-                Spacer(minLength: bottomPadding)
+                Spacer(minLength: bottomPadding + safeArea.bottom * 0.20)
             }
             .frame(width: size.width, height: size.height)
         }
@@ -433,47 +436,127 @@ private struct SongRow: View {
 
 private struct NowPlayingPanel: View {
     @EnvironmentObject private var library: MusicLibraryModel
+    @State private var carouselIndex = 0
+    @State private var didSyncInitialSelection = false
+    @State private var isSyncingFromModel = false
 
     var body: some View {
         ScreenChrome(title: "Now Playing") {
-            GeometryReader { proxy in
-                if let song = library.nowPlaying ?? library.selectedSong {
-                    let artSize = min(proxy.size.height * 0.76, proxy.size.width * 0.42, 168)
-
-                    HStack(spacing: 15) {
-                        ArtworkTile(song: song, size: artSize)
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(song.title)
-                                .font(.screenTitle)
-                                .foregroundStyle(Color.screenTint)
-                                .lineLimit(2)
-
-                            Text(song.artistName)
-                                .font(.screenBody)
-                                .foregroundStyle(Color.screenMuted)
-                                .lineLimit(1)
-
-                            Spacer(minLength: 0)
-
-                            HStack(spacing: 7) {
-                                Image(systemName: library.isPlaying ? "play.fill" : "pause.fill")
-                                    .font(.system(size: 10, weight: .bold))
-
-                                Text(DurationText.string(from: song.duration))
-                                    .font(.screenSmall)
-                                    .monospacedDigit()
+            if library.songs.isEmpty {
+                ScreenStatus(title: "Music", message: "No selection")
+            } else {
+                GeometryReader { proxy in
+                    TabView(selection: $carouselIndex) {
+                        ForEach(Array(library.songs.enumerated()), id: \.element.id) { index, song in
+                            AlbumCoverPage(
+                                song: song,
+                                isPlaying: library.isPlaying && song.id == library.nowPlaying?.id,
+                                size: proxy.size
+                            )
+                            .tag(index)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                library.select(index: index)
+                                Task {
+                                    await library.playSelected()
+                                }
                             }
-                            .foregroundStyle(Color.screenTint)
                         }
-                        .frame(maxWidth: .infinity, maxHeight: artSize, alignment: .leading)
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                } else {
-                    ScreenStatus(title: "Music", message: "No selection")
+                    .tabViewStyle(.page(indexDisplayMode: .never))
+                    .onAppear {
+                        syncCarouselToSelection()
+                        DispatchQueue.main.async {
+                            didSyncInitialSelection = true
+                        }
+                    }
+                    .onChange(of: library.selectedSongID) { _ in
+                        syncCarouselToSelection()
+                    }
+                    .onChange(of: carouselIndex) { index in
+                        guard didSyncInitialSelection, !isSyncingFromModel else {
+                            return
+                        }
+
+                        guard library.songs.indices.contains(index) else {
+                            return
+                        }
+
+                        library.select(index: index)
+                        Task {
+                            await library.playSelected()
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private func syncCarouselToSelection() {
+        let targetIndex = selectedSongIndex
+        guard targetIndex != carouselIndex else {
+            return
+        }
+
+        isSyncingFromModel = true
+        carouselIndex = targetIndex
+        DispatchQueue.main.async {
+            isSyncingFromModel = false
+        }
+    }
+
+    private var selectedSongIndex: Int {
+        guard let selectedSongID = library.selectedSongID else {
+            return 0
+        }
+
+        return library.songs.firstIndex { $0.id == selectedSongID } ?? 0
+    }
+}
+
+private struct AlbumCoverPage: View {
+    let song: Song
+    let isPlaying: Bool
+    let size: CGSize
+
+    private var artworkSize: CGFloat {
+        min(size.width * 0.64, size.height * 0.62, 190)
+    }
+
+    var body: some View {
+        VStack(spacing: 9) {
+            ArtworkTile(song: song, size: artworkSize)
+                .shadow(color: Color.black.opacity(0.28), radius: 14, x: 0, y: 8)
+
+            VStack(spacing: 3) {
+                Text(song.title)
+                    .font(.screenTitle)
+                    .foregroundStyle(Color.screenTint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+
+                Text(song.artistName)
+                    .font(.screenBody)
+                    .foregroundStyle(Color.screenMuted)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.78)
+            }
+            .frame(maxWidth: size.width * 0.86)
+
+            HStack(spacing: 8) {
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 11, weight: .bold))
+
+                Text(DurationText.string(from: song.duration))
+                    .font(.screenSmall)
+                    .monospacedDigit()
+            }
+            .foregroundStyle(Color.screenTint)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        .padding(.horizontal, 8)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(song.title), \(song.artistName)")
     }
 }
 
